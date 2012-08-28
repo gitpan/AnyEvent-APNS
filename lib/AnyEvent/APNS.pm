@@ -13,7 +13,7 @@ use Encode;
 use Scalar::Util 'looks_like_number';
 use JSON::Any;
 
-our $VERSION = '0.08';
+our $VERSION = '0.09';
 
 has certificate => (
     is       => 'rw',
@@ -53,6 +53,11 @@ has on_error => (
     is      => 'rw',
     isa     => 'CodeRef',
     default => sub { sub { warn @_ } },
+);
+
+has on_eof => (
+    is  => 'rw',
+    isa => 'CodeRef',
 );
 
 has on_connect => (
@@ -179,6 +184,17 @@ sub connect {
         );
         $self->handler( $handle );
 
+        if ($self->on_eof) {
+            $handle->on_eof(sub {
+                $self->on_eof->(@_);
+                $self->clear_handler;
+                $_[0]->destroy;
+            });
+        }
+
+        # ignore read
+        $handle->on_read(sub { delete $_[0]->{rbuf} });
+
         $self->on_connect->();
     };
 
@@ -283,6 +299,12 @@ Callback to be called when something error occurs.
 This is wrapper for L<AnyEvent::Handle>'s on_error callbacks. Look at the document for more detail.
 
 Optional (Default: just warn error)
+
+=item on_eof => $cb->($handle)
+
+Callback to be called when an end-of-file condition is detected.
+
+Optional. (Default: use on_error instead. read L<AnyEvent::Handle> for more detail)
 
 =item on_connect => $cb->()
 
