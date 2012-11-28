@@ -13,7 +13,7 @@ use Encode;
 use Scalar::Util 'looks_like_number';
 use JSON::Any;
 
-our $VERSION = '0.09';
+our $VERSION = '0.10';
 
 has certificate => (
     is       => 'rw',
@@ -66,6 +66,11 @@ has on_connect => (
     default => sub { sub {} },
 );
 
+has on_error_response => (
+    is  => 'rw',
+    isa => 'CodeRef',
+);
+
 has debug_port => (
     is        => 'rw',
     isa       => 'Int',
@@ -77,17 +82,33 @@ has _con_guard => (
     isa => 'Object',
 );
 
+has last_identifier => (
+    is      => 'rw',
+    isa     => 'Int',
+    default => sub { 0; }
+);
+
 no Any::Moose;
 
 sub send {
     my $self = shift;
-    my ($token, $payload) = @_;
+    my ($token, $payload, $expiry) = @_;
 
     my $json = encode_utf8( $self->json_driver->encode($payload) );
 
-    my $h = $self->handler;
-    $h->push_write( pack('C', 0) ); # command
+    # http://developer.apple.com/library/ios/#DOCUMENTATION/NetworkingInternet/Conceptual/RemoteNotificationsPG/CommunicatingWIthAPS/CommunicatingWIthAPS.html
+    # Expiry—A fixed UNIX epoch date expressed in seconds (UTC) that identifies when the notification is no longer valid and can be discarded. The expiry value should be in network order (big endian). If the expiry value is positive, APNs tries to deliver the notification at least once. You can specify zero or a value less than zero to request that APNs not store the notification at all.
+    # default to 24 hours
+    $expiry  = defined $expiry ? $expiry : time() + 3600 * 24;
 
+    # Identifier—An arbitrary value that identifies this notification. This same identifier is returned in a error-response packet if APNs cannot interpret a notification.
+    my $next_identifier = $self->_increment_identifier;
+
+    my $h = $self->handler;
+
+    $h->push_write( pack('C', 1) ); # command
+    $h->push_write( pack('N', $next_identifier) );
+    $h->push_write( pack('N', $expiry) );
     $h->push_write( pack('n', bytes::length($token)) ); # token length
     $h->push_write( $token );                           # device token
 
@@ -112,6 +133,8 @@ sub send {
 
     $h->push_write( pack('n', bytes::length($json)) ); # payload length
     $h->push_write( $json );                           # payload
+
+    return $next_identifier;
 }
 
 sub _trim_utf8 {
@@ -192,8 +215,16 @@ sub connect {
             });
         }
 
-        # ignore read
-        $handle->on_read(sub { delete $_[0]->{rbuf} });
+        if ( $self->on_error_response ) {
+            $handle->on_read(
+                sub {
+                    $self->_on_read_with_error_callback( @_ );
+                }
+            );
+        }
+        else {
+            $handle->on_read( sub { delete $_[0]->{rbuf} } );
+        }
 
         $self->on_connect->();
     };
@@ -202,6 +233,37 @@ sub connect {
     $self->_con_guard($g);
 
     $self;
+}
+
+sub _on_read_with_error_callback {
+    my ($self, $handle) = @_;
+    $handle->push_read( chunk => 1,
+                        sub {
+                            my $command = unpack( 'C', $_[1] );
+                            if ( $command != 8 ) {
+                                # something is wrong
+                                # auto reconnect
+                                $self->clear_handler;
+                                $self->connect;
+                            }
+                        });
+    $handle->push_read( chunk => 5,
+                        sub {
+                            my $status     = unpack( 'C', substr( $_[1], 0, 1) );
+                            my $identifier = unpack( 'N', substr( $_[1], 1, 4) );
+                            $self->on_error_response->( $identifier => $status );
+                        });
+}
+
+# 0 ... 2**32-1, 0 ... 2**32-1, 0 ...
+sub _increment_identifier {
+    my ($self) = @_;
+    my $next_identifier = $self->last_identifier + 1;
+    if ( $next_identifier >= 2 ** 32 ) {
+        # identifier is only 4 bytes
+        $next_identifier = 0;
+    }
+    $self->last_identifier( $next_identifier );
 }
 
 __PACKAGE__->meta->make_immutable;
@@ -218,31 +280,35 @@ AnyEvent::APNS - Simple wrapper for Apple Push Notifications Service (APNS) prov
 =head1 SYNOPSIS
 
     use AnyEvent::APNS;
-    
+
     my $cv = AnyEvent->condvar;
-    
+
     my $apns; $apns = AnyEvent::APNS->new(
         certificate => 'your apns certificate file',
         private_key => 'your apns private key file',
         sandbox     => 1,
         on_error    => sub { # something went wrong },
         on_connect  => sub {
-            $apns->send( $device_token => {
+            my $identifier = $apns->send( $device_token => {
                 aps => {
                     alert => 'Message received from Bob',
                 },
             });
         },
+        on_error_response => sub {
+            my ($identifier, $status) = @_;
+            # something wrong
+        },
     );
     $apns->connect;
-    
+
     # disconnect and exit program as soon as possible after sending a message
     # otherwise $apns makes persistent connection with apns server
     $apns->handler->on_drain(sub {
         undef $_[0];
         $cv->send;
     });
-    
+
     $cv->recv;
 
 =head1 DESCRIPTION
@@ -312,6 +378,16 @@ Callback to be called when connection established to apns server.
 
 Optional (Default: empty coderef)
 
+=item on_error_response => $cb->($identifier, $status)
+
+Callback to be called when APNs detects notification malformed or otherwise unintelligible.
+
+C<$status> codes are documented here: L<http://developer.apple.com/library/ios/#DOCUMENTATION/NetworkingInternet/Conceptual/RemoteNotificationsPG/CommunicatingWIthAPS/CommunicatingWIthAPS.html>
+
+C<$identifier> is the return value of C<send>.
+
+Optional (Default: ignore)
+
 =back
 
 =head2 $apns->connect;
@@ -322,7 +398,7 @@ Connect to apns server.
 
 Send apns messages with C<\%payload> to device specified C<$device_token>.
 
-    $apns->send( $device_token => {
+    my $identifier = $apns->send( $device_token => {
         aps => {
             alert => 'Message received from Bob',
         },
@@ -333,6 +409,8 @@ C<$device_token> should be a binary 32bytes device token provided by iPhone SDK 
 C<\%payload> should be a hashref suitable to apple document: L<http://developer.apple.com/iPhone/library/documentation/NetworkingInternet/Conceptual/RemoteNotificationsPG/ApplePushService/ApplePushService.html>
 
 Note: If you involve multi-byte strings in C<\%payload>, it should be utf8 decoded strings not utf8 bytes.
+
+Store C<$identifier> with your C<$device_token> to react to C<on_error_response>.
 
 =head2 $apns->handler
 
